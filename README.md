@@ -278,13 +278,26 @@ y, sK = proj(x, eq_b=b, return_state=True)
 
 On CUDA, `Project` compiles the ADMM loop with `torch.compile` (eager on
 CPU by default). Gradients use the implicit function theorem, matching the
-JAX custom VJP. Compare runtimes with JAX and qpth via:
+JAX custom VJP.
+
+A batched primal-dual interior-point QP solver is also available as a
+faster qpth-compatible layer. Pass unbatched `Q`, `G`, and `A` when they
+are shared across the batch (the usual projection-layer case):
+
+```python
+from pinet.torch import QPFunction, project_affine, solve_qp
+
+zhat = QPFunction(max_iter=20)(q_mat, p, g_mat, h, a_mat, b)
+y = project_affine(x, a_mat, b, g_mat, h)   # Q = I, p = -x
+```
+
+Compare runtimes with JAX, the Torch ADMM projector, qpth, and `pinet-qp`:
 
 ```bash
 python -m src.benchmarks.torch.bench_project
 ```
 
-Install qpth for the third column with `pip install qpth --no-deps`.
+Install qpth for the qpth column with `pip install qpth --no-deps`.
 qpth 0.0.18 pins `numpy<2`, which conflicts with JAX, so skip its
 dependencies; the rest of this package already provides them.
 

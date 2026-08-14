@@ -1,4 +1,4 @@
-"""Compare pinet JAX, pinet Torch, and qpth on polyhedral projections.
+"""Compare pinet JAX, pinet Torch, qpth, and pinet-qp on polyhedral projections.
 
 Usage:
 
@@ -319,6 +319,111 @@ def _run_qpth(
     return y, mean_ms, std_ms
 
 
+def _run_pinet_qp(
+    a_mat: np.ndarray,
+    b: np.ndarray,
+    c_mat: np.ndarray,
+    lb: np.ndarray,
+    ub: np.ndarray,
+    x: np.ndarray,
+    warmup: int,
+    repeats: int,
+    device: str,
+) -> tuple[np.ndarray, float, float]:
+    """Time the pinet PDIPM on the equivalent QP.
+
+    Shared ``Q``, ``G``, and ``A`` stay unbatched. That is the projection-layer
+    case qpth expands internally on every call.
+
+    Args:
+        a_mat: Equality matrix.
+        b: Equality right-hand side.
+        c_mat: Inequality matrix.
+        lb: Inequality lower bound.
+        ub: Inequality upper bound.
+        x: Points to project, shape ``(B, dim)``.
+        warmup: Untimed calls.
+        repeats: Timed calls.
+        device: Torch device string.
+
+    Returns:
+        Tuple ``(y, mean_ms, std_ms)``.
+    """
+    import torch
+
+    from pinet.torch import project_affine
+
+    x_t = torch.tensor(x, dtype=torch.float64, device=device)
+    a_t = torch.tensor(a_mat[0], dtype=torch.float64, device=device)
+    b_t = torch.tensor(b[0, :, 0], dtype=torch.float64, device=device)
+    g_t = torch.tensor(
+        np.concatenate([c_mat[0], -c_mat[0]], axis=0),
+        dtype=torch.float64,
+        device=device,
+    )
+    h_t = torch.tensor(
+        np.concatenate([ub[0, :, 0], -lb[0, :, 0]], axis=0),
+        dtype=torch.float64,
+        device=device,
+    )
+
+    def _sync(result: object) -> None:
+        del result
+        if device == "cuda":
+            torch.cuda.synchronize()
+
+    def _call() -> torch.Tensor:
+        with torch.no_grad():
+            return project_affine(x_t, a_t, b_t, g_t, h_t)
+
+    mean_ms, std_ms = _time_call(_call, warmup, repeats, _sync)
+    y = _call().detach().cpu().numpy()
+    return y, mean_ms, std_ms
+
+
+def _append_solver(
+    results: list[BenchResult],
+    name: str,
+    batch_size: int,
+    y: np.ndarray,
+    mean_ms: float,
+    std_ms: float,
+    y_jax: np.ndarray,
+    a_mat: np.ndarray,
+    b: np.ndarray,
+    c_mat: np.ndarray,
+    lb: np.ndarray,
+    ub: np.ndarray,
+) -> None:
+    """Append a timed solver row.
+
+    Args:
+        results: Accumulator.
+        name: Solver name.
+        batch_size: Number of problems.
+        y: Solver output.
+        mean_ms: Mean wall time.
+        std_ms: Wall-time standard deviation.
+        y_jax: JAX reference solution.
+        a_mat: Equality matrix.
+        b: Equality right-hand side.
+        c_mat: Inequality matrix.
+        lb: Inequality lower bound.
+        ub: Inequality upper bound.
+    """
+    results.append(
+        BenchResult(
+            name=name,
+            batch_size=batch_size,
+            mean_ms=mean_ms,
+            std_ms=std_ms,
+            throughput=1000.0 * batch_size / mean_ms,
+            max_diff_jax=float(np.max(np.abs(y - y_jax))),
+            max_cv=_polytope_cv(y, a_mat, b, c_mat, lb, ub),
+        )
+    )
+
+
 def run_benchmark(
     dim: int = 100,
     n_eq: int = 50,
@@ -332,7 +437,7 @@ def run_benchmark(
     seed: int = 0,
     device: str | None = None,
 ) -> list[BenchResult]:
-    """Run the three-way projection benchmark.
+    """Run the projection benchmark against JAX, Torch ADMM, qpth, and pinet-qp.
 
     Args:
         dim: Primal dimension.
@@ -416,35 +521,55 @@ def run_benchmark(
                     skipped=qpth_error,
                 )
             )
-            continue
-        try:
-            y_qpth, q_mean, q_std = _run_qpth(
-                a_mat, b, c_mat, lb, ub, x, warmup, repeats, device
-            )
-            results.append(
-                BenchResult(
-                    name="qpth",
-                    batch_size=batch_size,
-                    mean_ms=q_mean,
-                    std_ms=q_std,
-                    throughput=1000.0 * batch_size / q_mean,
-                    max_diff_jax=float(np.max(np.abs(y_qpth - y_jax))),
-                    max_cv=_polytope_cv(y_qpth, a_mat, b, c_mat, lb, ub),
+        else:
+            try:
+                y_qpth, q_mean, q_std = _run_qpth(
+                    a_mat, b, c_mat, lb, ub, x, warmup, repeats, device
                 )
-            )
-        except (RuntimeError, ValueError, TypeError) as exc:
-            results.append(
-                BenchResult(
-                    name="qpth",
-                    batch_size=batch_size,
-                    mean_ms=None,
-                    std_ms=None,
-                    throughput=None,
-                    max_diff_jax=None,
-                    max_cv=None,
-                    skipped=str(exc),
+                _append_solver(
+                    results,
+                    "qpth",
+                    batch_size,
+                    y_qpth,
+                    q_mean,
+                    q_std,
+                    y_jax,
+                    a_mat,
+                    b,
+                    c_mat,
+                    lb,
+                    ub,
                 )
-            )
+            except (RuntimeError, ValueError, TypeError) as exc:
+                results.append(
+                    BenchResult(
+                        name="qpth",
+                        batch_size=batch_size,
+                        mean_ms=None,
+                        std_ms=None,
+                        throughput=None,
+                        max_diff_jax=None,
+                        max_cv=None,
+                        skipped=str(exc),
+                    )
+                )
+        y_qp, qp_mean, qp_std = _run_pinet_qp(
+            a_mat, b, c_mat, lb, ub, x, warmup, repeats, device
+        )
+        _append_solver(
+            results,
+            "pinet-qp",
+            batch_size,
+            y_qp,
+            qp_mean,
+            qp_std,
+            y_jax,
+            a_mat,
+            b,
+            c_mat,
+            lb,
+            ub,
+        )
     return results
 
 
@@ -459,13 +584,13 @@ def _format_table(results: list[BenchResult], device: str) -> str:
         Printable table.
     """
     header = (
-        f"{'solver':<14} {'B':>6} {'mean_ms':>12} {'std_ms':>10} "
+        f"{'solver':<16} {'B':>6} {'mean_ms':>12} {'std_ms':>10} "
         f"{'probs/s':>12} {'||Δjax||':>12} {'max_cv':>12}"
     )
     lines = [f"device={device}", header, "-" * len(header)]
     for row in results:
         if row.skipped:
-            lines.append(f"{row.name:<14} {row.batch_size:>6}   skipped: {row.skipped}")
+            lines.append(f"{row.name:<16} {row.batch_size:>6}   skipped: {row.skipped}")
             continue
         assert row.mean_ms is not None
         assert row.std_ms is not None
@@ -473,7 +598,7 @@ def _format_table(results: list[BenchResult], device: str) -> str:
         assert row.max_cv is not None
         diff = "n/a" if row.max_diff_jax is None else f"{row.max_diff_jax:.3e}"
         lines.append(
-            f"{row.name:<14} {row.batch_size:>6} {row.mean_ms:>12.3f} "
+            f"{row.name:<16} {row.batch_size:>6} {row.mean_ms:>12.3f} "
             f"{row.std_ms:>10.3f} {row.throughput:>12.1f} {diff:>12} "
             f"{row.max_cv:>12.3e}"
         )
