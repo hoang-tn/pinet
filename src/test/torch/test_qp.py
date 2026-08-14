@@ -261,3 +261,74 @@ def test_matches_qpth_when_installed() -> None:
     assert torch.allclose(y_fast, y_qpth, atol=1e-5, rtol=1e-5), (
         f"qpth mismatch: max abs {(y_fast - y_qpth).abs().max().item()}"
     )
+    y_hybrid = project_affine(_t(x), _t(a_mat), _t(b), _t(g_mat), _t(h))
+    assert torch.allclose(y_hybrid, y_qpth, atol=1e-5, rtol=1e-5), (
+        f"hybrid qpth mismatch: max abs {(y_hybrid - y_qpth).abs().max().item()}"
+    )
+
+
+def test_hybrid_matches_pdipm() -> None:
+    """ADMM plus active-set polish agrees with the full PDIPM."""
+    a_mat, b, c_mat, lb, ub = _feasible_polytope(12, 5, 6, SEED + 6)
+    g_mat, h = _two_sided_gh(c_mat, lb, ub)
+    rng = np.random.default_rng(SEED + 7)
+    x = rng.uniform(-2.0, 2.0, size=(32, 12))
+    y_hy = project_affine(_t(x), _t(a_mat), _t(b), _t(g_mat), _t(h))
+    y_ipm = project_affine(_t(x), _t(a_mat), _t(b), _t(g_mat), _t(h), solver="pdipm")
+    assert torch.allclose(y_hy, y_ipm, atol=1e-8, rtol=1e-8), (
+        f"hybrid vs PDIPM max abs {(y_hy - y_ipm).abs().max().item()}"
+    )
+    cv = _polytope_cv(y_hy.detach().numpy(), a_mat, b, g_mat, h)
+    assert cv < 1e-8, f"Hybrid constraint violation {cv} is not qpth-level"
+
+
+def test_hybrid_fallback_matches_pdipm() -> None:
+    """A weak warm start still recovers the PDIPM solution via fallback."""
+    a_mat, b, c_mat, lb, ub = _feasible_polytope(8, 3, 4, SEED + 8)
+    g_mat, h = _two_sided_gh(c_mat, lb, ub)
+    rng = np.random.default_rng(SEED + 9)
+    x = rng.uniform(-2.0, 2.0, size=(16, 8))
+    y_hy = project_affine(
+        _t(x), _t(a_mat), _t(b), _t(g_mat), _t(h), n_admm=0, max_repair=2
+    )
+    y_ipm = project_affine(_t(x), _t(a_mat), _t(b), _t(g_mat), _t(h), solver="pdipm")
+    assert torch.allclose(y_hy, y_ipm, atol=1e-8, rtol=1e-8), (
+        f"fallback vs PDIPM max abs {(y_hy - y_ipm).abs().max().item()}"
+    )
+
+
+def test_hybrid_gradient_matches_finite_difference() -> None:
+    """Hybrid KKT backward matches central differences on ``x``."""
+    a_mat, b, c_mat, lb, ub = _feasible_polytope(6, 2, 3, SEED)
+    g_mat, h = _two_sided_gh(c_mat, lb, ub)
+    rng = np.random.default_rng(SEED + 10)
+    x0 = _t(rng.normal(size=(3, 6))).requires_grad_(True)
+    vec = _t(rng.normal(size=(3, 6)))
+
+    def loss_at(x: Tensor) -> Tensor:
+        y = project_affine(x, _t(a_mat), _t(b), _t(g_mat), _t(h))
+        return (y * vec).sum()
+
+    loss = loss_at(x0)
+    (grad,) = torch.autograd.grad(loss, x0)
+    direction = _t(rng.normal(size=x0.shape))
+    direction = direction / torch.linalg.vector_norm(direction)
+    eps = 1e-5
+    plus = loss_at(x0.detach() + eps * direction)
+    minus = loss_at(x0.detach() - eps * direction)
+    fd = (plus - minus) / (2 * eps)
+    directional = (grad * direction).sum()
+    assert torch.allclose(directional, fd, atol=1e-4, rtol=1e-3), (
+        f"FD {fd.item()} vs analytic {directional.item()}"
+    )
+
+
+def test_unknown_solver_rejected() -> None:
+    """An invalid ``solver`` name raises ``ValueError``."""
+    x = torch.zeros(1, 2, dtype=torch.float64)
+    g_mat = torch.eye(2, dtype=torch.float64)
+    h = torch.ones(2, dtype=torch.float64)
+    a_mat = torch.empty(0, 2, dtype=torch.float64)
+    b = torch.empty(0, dtype=torch.float64)
+    with pytest.raises(ValueError, match="Unknown solver"):
+        project_affine(x, a_mat, b, g_mat, h, solver="newton")

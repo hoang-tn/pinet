@@ -288,10 +288,18 @@ are shared across the batch (the usual projection-layer case):
 from pinet.torch import QPFunction, project_affine, solve_qp
 
 zhat = QPFunction(max_iter=20)(q_mat, p, g_mat, h, a_mat, b)
-y = project_affine(x, a_mat, b, g_mat, h)   # Q = I, p = -x
+y = project_affine(x, a_mat, b, g_mat, h)   # ADMM + active-set polish
+y = project_affine(x, a_mat, b, g_mat, h, solver="pdipm")  # full PDIPM
 ```
 
-Compare runtimes with JAX, the Torch ADMM projector, qpth, and `pinet-qp`:
+`project_affine` defaults to a hybrid solver: Douglas-Rachford to identify
+the active face, a few identity-`Q` KKT solves to polish to qpth-level
+accuracy, and PDIPM only on rows that do not stabilize. That is the path
+that aims for pinet-ADMM speed with qpth constraint violation
+(~1e-15). `QPFunction` / `solve_qp` stay a full PDIPM for general `Q`.
+
+Compare runtimes with JAX, the Torch ADMM projector, qpth, `pinet-qp`
+(PDIPM), and `pinet-hybrid`:
 
 ```bash
 python -m src.benchmarks.torch.bench_project

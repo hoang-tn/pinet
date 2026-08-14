@@ -7,8 +7,10 @@ Import this submodule for a ``torch.nn.Module`` API:
     from pinet.torch import Project, EqualityConstraint, BoxConstraint
     y = Project(eq, box)(x)
 
-A batched PDIPM (``QPFunction`` / ``solve_qp``) is also available as a
-faster qpth-compatible quadratic-program layer.
+A batched PDIPM (``QPFunction`` / ``solve_qp``) and a hybrid affine
+projector (``project_affine``) are also available. The hybrid path
+combines ADMM with an active-set polish so Euclidean projections can
+reach qpth accuracy at near-ADMM cost.
 """
 
 from pinet.constraints.non_linear_types import (

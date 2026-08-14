@@ -1,4 +1,4 @@
-"""Compare pinet JAX, pinet Torch, qpth, and pinet-qp on polyhedral projections.
+"""Compare pinet JAX, pinet Torch, qpth, pinet-qp, and pinet-hybrid.
 
 Usage:
 
@@ -374,6 +374,65 @@ def _run_pinet_qp(
 
     def _call() -> torch.Tensor:
         with torch.no_grad():
+            return project_affine(x_t, a_t, b_t, g_t, h_t, solver="pdipm")
+
+    mean_ms, std_ms = _time_call(_call, warmup, repeats, _sync)
+    y = _call().detach().cpu().numpy()
+    return y, mean_ms, std_ms
+
+
+def _run_pinet_hybrid(
+    a_mat: np.ndarray,
+    b: np.ndarray,
+    c_mat: np.ndarray,
+    lb: np.ndarray,
+    ub: np.ndarray,
+    x: np.ndarray,
+    warmup: int,
+    repeats: int,
+    device: str,
+) -> tuple[np.ndarray, float, float]:
+    """Time ADMM plus active-set polish on the equivalent projection.
+
+    Args:
+        a_mat: Equality matrix.
+        b: Equality right-hand side.
+        c_mat: Inequality matrix.
+        lb: Inequality lower bound.
+        ub: Inequality upper bound.
+        x: Points to project, shape ``(B, dim)``.
+        warmup: Untimed calls.
+        repeats: Timed calls.
+        device: Torch device string.
+
+    Returns:
+        Tuple ``(y, mean_ms, std_ms)``.
+    """
+    import torch
+
+    from pinet.torch import project_affine
+
+    x_t = torch.tensor(x, dtype=torch.float64, device=device)
+    a_t = torch.tensor(a_mat[0], dtype=torch.float64, device=device)
+    b_t = torch.tensor(b[0, :, 0], dtype=torch.float64, device=device)
+    g_t = torch.tensor(
+        np.concatenate([c_mat[0], -c_mat[0]], axis=0),
+        dtype=torch.float64,
+        device=device,
+    )
+    h_t = torch.tensor(
+        np.concatenate([ub[0, :, 0], -lb[0, :, 0]], axis=0),
+        dtype=torch.float64,
+        device=device,
+    )
+
+    def _sync(result: object) -> None:
+        del result
+        if device == "cuda":
+            torch.cuda.synchronize()
+
+    def _call() -> torch.Tensor:
+        with torch.no_grad():
             return project_affine(x_t, a_t, b_t, g_t, h_t)
 
     mean_ms, std_ms = _time_call(_call, warmup, repeats, _sync)
@@ -437,7 +496,7 @@ def run_benchmark(
     seed: int = 0,
     device: str | None = None,
 ) -> list[BenchResult]:
-    """Run the projection benchmark against JAX, Torch ADMM, qpth, and pinet-qp.
+    """Run the projection benchmark against JAX, Torch ADMM, qpth, PDIPM, and hybrid.
 
     Args:
         dim: Primal dimension.
@@ -563,6 +622,23 @@ def run_benchmark(
             y_qp,
             qp_mean,
             qp_std,
+            y_jax,
+            a_mat,
+            b,
+            c_mat,
+            lb,
+            ub,
+        )
+        y_hy, hy_mean, hy_std = _run_pinet_hybrid(
+            a_mat, b, c_mat, lb, ub, x, warmup, repeats, device
+        )
+        _append_solver(
+            results,
+            "pinet-hybrid",
+            batch_size,
+            y_hy,
+            hy_mean,
+            hy_std,
             y_jax,
             a_mat,
             b,
