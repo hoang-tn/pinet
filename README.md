@@ -278,13 +278,38 @@ y, sK = proj(x, eq_b=b, return_state=True)
 
 On CUDA, `Project` compiles the ADMM loop with `torch.compile` (eager on
 CPU by default). Gradients use the implicit function theorem, matching the
-JAX custom VJP. Compare runtimes with JAX and qpth via:
+JAX custom VJP.
+
+A batched primal-dual interior-point QP solver is also available as a
+faster qpth-compatible layer. Pass unbatched `Q`, `G`, and `A` when they
+are shared across the batch (the usual projection-layer case):
+
+```python
+from pinet.torch import QPFunction, project_affine, solve_qp
+
+zhat = QPFunction(max_iter=20)(q_mat, p, g_mat, h, a_mat, b)
+y = project_affine(x, a_mat, b, g_mat, h)   # ADMM + active-set polish
+y = project_affine(x, a_mat, b, g_mat, h, solver="pdipm")  # full PDIPM
+```
+
+`project_affine` defaults to a hybrid solver: Douglas-Rachford to identify
+the active face, a few identity-`Q` KKT solves to polish to qpth-level
+accuracy, and PDIPM only on rows that do not stabilize. That is the path
+that aims for pinet-ADMM speed with qpth constraint violation
+(~1e-15). `QPFunction` / `solve_qp` stay a full PDIPM for general `Q`.
+
+Compare runtimes with JAX, the Torch ADMM projector, qpth, `pinet-qp`
+(PDIPM), and `pinet-hybrid`:
 
 ```bash
 python -m src.benchmarks.torch.bench_project
+python -m src.benchmarks.torch.bench_project --suite
 ```
 
-Install qpth for the third column with `pip install qpth --no-deps`.
+`--suite` sweeps several polytope shapes and reports `||Δqp||` (error vs the
+high-accuracy PDIPM) as well as `||Δjax||` (error vs the JAX ADMM projector).
+
+Install qpth for the qpth column with `pip install qpth --no-deps`.
 qpth 0.0.18 pins `numpy<2`, which conflicts with JAX, so skip its
 dependencies; the rest of this package already provides them.
 
