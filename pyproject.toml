@@ -121,9 +121,15 @@ ignore = [
     "F722",
     "F821",
     "PLR2004", # Magic values are fine in benchmark scripts.
+    "PLR0917",
+    "PLC0415",
 ]
 "src/test/**" = [
     "PLR2004", # Magic values are fine in tests.
+]
+"src/pinet/torch/**" = [
+    "PLR2004",
+    "PLR0917",
 ]
 
 [tool.ruff.lint.pep8-naming]

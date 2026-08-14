@@ -1,9 +1,10 @@
 """Hard constraint neural network package.
 
 The jaxtyping import hook wraps every function and class defined under
-``pinet.*`` with ``beartype.beartype`` so the shape/dtype annotations in
-``pinet._typing`` are enforced at trace time — a mismatched argument
-surfaces at the call site instead of deep inside a jitted function.
+``pinet.*`` (except the Torch backend imported via ``pinet.torch``) with
+``beartype.beartype`` so the shape/dtype annotations in ``pinet._typing``
+are enforced at trace time — a mismatched argument surfaces at the call
+site instead of deep inside a jitted function.
 
 The hook is **on by default**. Set ``PINET_RUNTIME_CHECK=0`` before
 importing ``pinet`` to disable it (useful for latency-sensitive

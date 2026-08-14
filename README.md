@@ -251,6 +251,43 @@ cv = proj.cv(y)  # (B, 1, 1) max violation across constraints
                  # (shapes need to match, so be careful of lifting!)
 ```
 
+## PyTorch
+
+The same projector is available as a `torch.nn.Module`. Tensors may be
+`(B, n)` or `(B, n, 1)`; the output matches the input layout.
+
+```python
+import torch
+from pinet.torch import (
+    AffineInequalityConstraint,
+    BoxConstraint,
+    EqualityConstraint,
+    Project,
+)
+
+eq = EqualityConstraint(A, b, var_b=True)
+ineq = AffineInequalityConstraint(C, lb, ub)
+box = BoxConstraint(lb=lb_x, ub=ub_x)
+proj = Project(eq, ineq, box, n_iter=50)
+proj = proj.to(device)
+
+y = proj(x, eq_b=b)                 # x: (B, n) or (B, n, 1)
+cv = proj.cv(y)
+y, sK = proj(x, eq_b=b, return_state=True)
+```
+
+On CUDA, `Project` compiles the ADMM loop with `torch.compile` (eager on
+CPU by default). Gradients use the implicit function theorem, matching the
+JAX custom VJP. Compare runtimes with JAX and qpth via:
+
+```bash
+python -m src.benchmarks.torch.bench_project
+```
+
+Install qpth for the third column with `pip install qpth --no-deps`.
+qpth 0.0.18 pins `numpy<2`, which conflicts with JAX, so skip its
+dependencies; the rest of this package already provides them.
+
 ### Notes
 - **Batch rules:** For each pair of tensors `(X, Y)`, either batch sizes match or one is `1` (broadcast).
 - **Equality `method`:** Use `method="pinv"` when you rely on the equality projector standalone. When used inside `Project`, you can keep `method=None`; lifting will set up the pseudo-inverse internally.
