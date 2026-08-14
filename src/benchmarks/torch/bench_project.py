@@ -390,7 +390,7 @@ def run_benchmark(
             warmup,
             repeats,
             device,
-            compile_model=True,
+            compile_model=device == "cuda",
         )
         results.append(
             BenchResult(
@@ -471,7 +471,7 @@ def _format_table(results: list[BenchResult], device: str) -> str:
         assert row.std_ms is not None
         assert row.throughput is not None
         assert row.max_cv is not None
-        diff = "—" if row.max_diff_jax is None else f"{row.max_diff_jax:.3e}"
+        diff = "n/a" if row.max_diff_jax is None else f"{row.max_diff_jax:.3e}"
         lines.append(
             f"{row.name:<14} {row.batch_size:>6} {row.mean_ms:>12.3f} "
             f"{row.std_ms:>10.3f} {row.throughput:>12.1f} {diff:>12} "
