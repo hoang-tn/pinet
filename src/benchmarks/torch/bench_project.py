@@ -1,11 +1,16 @@
 """Compare pinet JAX, pinet Torch, qpth, pinet-qp, and pinet-hybrid.
 
+``pinet-jax`` is the original JAX ADMM projector. ``pinet-qp`` is the Torch
+PDIPM. ``pinet-hybrid`` is ADMM plus active-set polish. High-accuracy error
+is reported against ``pinet-qp`` (``||Δqp||``), not against JAX.
+
 Usage:
 
 .. code-block:: console
 
     $ python -m src.benchmarks.torch.bench_project
     $ python -m src.benchmarks.torch.bench_project --dim 20 --repeats 10
+    $ python -m src.benchmarks.torch.bench_project --suite
 """
 
 from __future__ import annotations
@@ -21,6 +26,15 @@ import numpy as np
 
 BATCH_SIZES = (1, 16, 64, 256, 1024)
 
+SUITE_CASES: tuple[tuple[str, int, int, int], ...] = (
+    ("tiny", 20, 10, 10),
+    ("medium", 50, 25, 25),
+    ("large", 100, 50, 50),
+    ("ineq-heavy", 50, 10, 40),
+    ("eq-heavy", 50, 40, 10),
+    ("wide", 100, 25, 25),
+)
+
 
 @dataclass
 class BenchResult:
@@ -32,7 +46,8 @@ class BenchResult:
         mean_ms: Mean wall time in milliseconds.
         std_ms: Standard deviation of wall time.
         throughput: Problems solved per second.
-        max_diff_jax: Max abs difference vs JAX (None for the JAX row).
+        max_diff_jax: Max abs difference vs the JAX ADMM projector.
+        max_diff_qp: Max abs difference vs the Torch PDIPM (``pinet-qp``).
         max_cv: Max constraint violation.
         skipped: Skip reason, if the solver was not run.
     """
@@ -43,6 +58,7 @@ class BenchResult:
     std_ms: float | None
     throughput: float | None
     max_diff_jax: float | None
+    max_diff_qp: float | None
     max_cv: float | None
     skipped: str | None = None
 
@@ -448,6 +464,7 @@ def _append_solver(
     mean_ms: float,
     std_ms: float,
     y_jax: np.ndarray,
+    y_qp: np.ndarray | None,
     a_mat: np.ndarray,
     b: np.ndarray,
     c_mat: np.ndarray,
@@ -463,7 +480,8 @@ def _append_solver(
         y: Solver output.
         mean_ms: Mean wall time.
         std_ms: Wall-time standard deviation.
-        y_jax: JAX reference solution.
+        y_jax: JAX ADMM solution.
+        y_qp: High-accuracy PDIPM solution, if available.
         a_mat: Equality matrix.
         b: Equality right-hand side.
         c_mat: Inequality matrix.
@@ -478,6 +496,7 @@ def _append_solver(
             std_ms=std_ms,
             throughput=1000.0 * batch_size / mean_ms,
             max_diff_jax=float(np.max(np.abs(y - y_jax))),
+            max_diff_qp=(None if y_qp is None else float(np.max(np.abs(y - y_qp)))),
             max_cv=_polytope_cv(y, a_mat, b, c_mat, lb, ub),
         )
     )
@@ -495,6 +514,7 @@ def run_benchmark(
     repeats: int = 20,
     seed: int = 0,
     device: str | None = None,
+    skip_qpth: bool = False,
 ) -> list[BenchResult]:
     """Run the projection benchmark against JAX, Torch ADMM, qpth, PDIPM, and hybrid.
 
@@ -510,6 +530,7 @@ def run_benchmark(
         repeats: Timed calls per solver.
         seed: Problem RNG seed.
         device: Torch device; inferred from CUDA availability when omitted.
+        skip_qpth: If ``True``, do not time locuslab/qpth.
 
     Returns:
         One result row per solver and batch size.
@@ -522,24 +543,17 @@ def run_benchmark(
     rng = np.random.default_rng(seed + 1)
     results: list[BenchResult] = []
     qpth_error: str | None = None
-    if importlib.util.find_spec("qpth") is None:
+    run_qpth = True
+    if skip_qpth:
+        run_qpth = False
+    elif importlib.util.find_spec("qpth") is None:
+        run_qpth = False
         qpth_error = "qpth is not installed (pip install qpth --no-deps)"
 
     for batch_size in batch_sizes:
         x = rng.uniform(-2.0, 2.0, size=(batch_size, dim))
         y_jax, jax_mean, jax_std = _run_jax(
             a_mat, b, c_mat, lb, ub, x, n_iter, sigma, omega, warmup, repeats
-        )
-        results.append(
-            BenchResult(
-                name="pinet-jax",
-                batch_size=batch_size,
-                mean_ms=jax_mean,
-                std_ms=jax_std,
-                throughput=1000.0 * batch_size / jax_mean,
-                max_diff_jax=0.0,
-                max_cv=_polytope_cv(y_jax, a_mat, b, c_mat, lb, ub),
-            )
         )
         y_torch, torch_mean, torch_std = _run_torch(
             a_mat,
@@ -556,31 +570,43 @@ def run_benchmark(
             device,
             compile_model=device == "cuda",
         )
-        results.append(
-            BenchResult(
-                name="pinet-torch",
-                batch_size=batch_size,
-                mean_ms=torch_mean,
-                std_ms=torch_std,
-                throughput=1000.0 * batch_size / torch_mean,
-                max_diff_jax=float(np.max(np.abs(y_torch - y_jax))),
-                max_cv=_polytope_cv(y_torch, a_mat, b, c_mat, lb, ub),
-            )
+        y_qp, qp_mean, qp_std = _run_pinet_qp(
+            a_mat, b, c_mat, lb, ub, x, warmup, repeats, device
         )
-        if qpth_error is not None:
-            results.append(
-                BenchResult(
-                    name="qpth",
-                    batch_size=batch_size,
-                    mean_ms=None,
-                    std_ms=None,
-                    throughput=None,
-                    max_diff_jax=None,
-                    max_cv=None,
-                    skipped=qpth_error,
-                )
-            )
-        else:
+        y_hy, hy_mean, hy_std = _run_pinet_hybrid(
+            a_mat, b, c_mat, lb, ub, x, warmup, repeats, device
+        )
+        _append_solver(
+            results,
+            "pinet-jax",
+            batch_size,
+            y_jax,
+            jax_mean,
+            jax_std,
+            y_jax,
+            y_qp,
+            a_mat,
+            b,
+            c_mat,
+            lb,
+            ub,
+        )
+        _append_solver(
+            results,
+            "pinet-torch",
+            batch_size,
+            y_torch,
+            torch_mean,
+            torch_std,
+            y_jax,
+            y_qp,
+            a_mat,
+            b,
+            c_mat,
+            lb,
+            ub,
+        )
+        if run_qpth:
             try:
                 y_qpth, q_mean, q_std = _run_qpth(
                     a_mat, b, c_mat, lb, ub, x, warmup, repeats, device
@@ -593,6 +619,7 @@ def run_benchmark(
                     q_mean,
                     q_std,
                     y_jax,
+                    y_qp,
                     a_mat,
                     b,
                     c_mat,
@@ -608,13 +635,25 @@ def run_benchmark(
                         std_ms=None,
                         throughput=None,
                         max_diff_jax=None,
+                        max_diff_qp=None,
                         max_cv=None,
                         skipped=str(exc),
                     )
                 )
-        y_qp, qp_mean, qp_std = _run_pinet_qp(
-            a_mat, b, c_mat, lb, ub, x, warmup, repeats, device
-        )
+        elif qpth_error is not None:
+            results.append(
+                BenchResult(
+                    name="qpth",
+                    batch_size=batch_size,
+                    mean_ms=None,
+                    std_ms=None,
+                    throughput=None,
+                    max_diff_jax=None,
+                    max_diff_qp=None,
+                    max_cv=None,
+                    skipped=qpth_error,
+                )
+            )
         _append_solver(
             results,
             "pinet-qp",
@@ -623,14 +662,12 @@ def run_benchmark(
             qp_mean,
             qp_std,
             y_jax,
+            y_qp,
             a_mat,
             b,
             c_mat,
             lb,
             ub,
-        )
-        y_hy, hy_mean, hy_std = _run_pinet_hybrid(
-            a_mat, b, c_mat, lb, ub, x, warmup, repeats, device
         )
         _append_solver(
             results,
@@ -640,6 +677,7 @@ def run_benchmark(
             hy_mean,
             hy_std,
             y_jax,
+            y_qp,
             a_mat,
             b,
             c_mat,
@@ -649,21 +687,30 @@ def run_benchmark(
     return results
 
 
-def _format_table(results: list[BenchResult], device: str) -> str:
+def _format_table(
+    results: list[BenchResult],
+    device: str,
+    *,
+    title: str | None = None,
+) -> str:
     """Render a text table of benchmark rows.
 
     Args:
         results: Benchmark rows.
         device: Device used for Torch/qpth.
+        title: Optional problem-geometry header.
 
     Returns:
         Printable table.
     """
     header = (
         f"{'solver':<16} {'B':>6} {'mean_ms':>12} {'std_ms':>10} "
-        f"{'probs/s':>12} {'||Δjax||':>12} {'max_cv':>12}"
+        f"{'probs/s':>12} {'||Δjax||':>12} {'||Δqp||':>12} {'max_cv':>12}"
     )
-    lines = [f"device={device}", header, "-" * len(header)]
+    lines = []
+    if title is not None:
+        lines.append(title)
+    lines.extend([f"device={device}", header, "-" * len(header)])
     for row in results:
         if row.skipped:
             lines.append(f"{row.name:<16} {row.batch_size:>6}   skipped: {row.skipped}")
@@ -672,13 +719,60 @@ def _format_table(results: list[BenchResult], device: str) -> str:
         assert row.std_ms is not None
         assert row.throughput is not None
         assert row.max_cv is not None
-        diff = "n/a" if row.max_diff_jax is None else f"{row.max_diff_jax:.3e}"
+        diff_jax = "n/a" if row.max_diff_jax is None else f"{row.max_diff_jax:.3e}"
+        diff_qp = "n/a" if row.max_diff_qp is None else f"{row.max_diff_qp:.3e}"
         lines.append(
             f"{row.name:<16} {row.batch_size:>6} {row.mean_ms:>12.3f} "
-            f"{row.std_ms:>10.3f} {row.throughput:>12.1f} {diff:>12} "
-            f"{row.max_cv:>12.3e}"
+            f"{row.std_ms:>10.3f} {row.throughput:>12.1f} {diff_jax:>12} "
+            f"{diff_qp:>12} {row.max_cv:>12.3e}"
         )
     return "\n".join(lines)
+
+
+def run_suite(
+    batch_sizes: tuple[int, ...] = BATCH_SIZES,
+    warmup: int = 3,
+    repeats: int = 8,
+    n_iter: int = 50,
+    seed: int = 0,
+    device: str | None = None,
+    skip_qpth: bool = True,
+) -> str:
+    """Run the hybrid vs JAX comparison across several polytope geometries.
+
+    Args:
+        batch_sizes: Batch sizes to sweep.
+        warmup: Untimed calls per solver.
+        repeats: Timed calls per solver.
+        n_iter: ADMM iterations for pinet-jax / pinet-torch.
+        seed: Problem RNG seed.
+        device: Torch device; inferred from CUDA availability when omitted.
+        skip_qpth: If ``True``, skip locuslab/qpth (the suite compares JAX).
+
+    Returns:
+        Combined printable tables.
+    """
+    import torch
+
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    blocks: list[str] = []
+    for name, dim, n_eq, n_ineq in SUITE_CASES:
+        title = f"=== {name}: dim={dim} n_eq={n_eq} n_ineq={n_ineq} n_iter={n_iter} ==="
+        results = run_benchmark(
+            dim=dim,
+            n_eq=n_eq,
+            n_ineq=n_ineq,
+            n_iter=n_iter,
+            batch_sizes=batch_sizes,
+            warmup=warmup,
+            repeats=repeats,
+            seed=seed,
+            device=device,
+            skip_qpth=skip_qpth,
+        )
+        blocks.append(_format_table(results, device, title=title))
+    return "\n\n".join(blocks)
 
 
 def main() -> None:
@@ -688,8 +782,8 @@ def main() -> None:
     parser.add_argument("--n-eq", type=int, default=50)
     parser.add_argument("--n-ineq", type=int, default=50)
     parser.add_argument("--n-iter", type=int, default=50)
-    parser.add_argument("--repeats", type=int, default=20)
-    parser.add_argument("--warmup", type=int, default=5)
+    parser.add_argument("--repeats", type=int, default=None)
+    parser.add_argument("--warmup", type=int, default=None)
     parser.add_argument(
         "--batch-sizes",
         type=int,
@@ -697,21 +791,54 @@ def main() -> None:
         default=list(BATCH_SIZES),
     )
     parser.add_argument("--device", type=str, default=None)
+    parser.add_argument(
+        "--suite",
+        action="store_true",
+        help="Sweep several polytope geometries (hybrid vs JAX ADMM).",
+    )
+    parser.add_argument(
+        "--skip-qpth",
+        action="store_true",
+        help="Do not time locuslab/qpth.",
+    )
+    parser.add_argument(
+        "--with-qpth",
+        action="store_true",
+        help="Include qpth when running --suite (off by default).",
+    )
     args = parser.parse_args()
     import torch
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    if args.suite:
+        warmup = 3 if args.warmup is None else args.warmup
+        repeats = 8 if args.repeats is None else args.repeats
+        print(
+            run_suite(
+                batch_sizes=tuple(args.batch_sizes),
+                warmup=warmup,
+                repeats=repeats,
+                n_iter=args.n_iter,
+                device=device,
+                skip_qpth=not args.with_qpth,
+            )
+        )
+        return
+    warmup = 5 if args.warmup is None else args.warmup
+    repeats = 20 if args.repeats is None else args.repeats
     results = run_benchmark(
         dim=args.dim,
         n_eq=args.n_eq,
         n_ineq=args.n_ineq,
         n_iter=args.n_iter,
         batch_sizes=tuple(args.batch_sizes),
-        warmup=args.warmup,
-        repeats=args.repeats,
+        warmup=warmup,
+        repeats=repeats,
         device=device,
+        skip_qpth=args.skip_qpth,
     )
-    print(_format_table(results, device))
+    title = f"=== dim={args.dim} n_eq={args.n_eq} n_ineq={args.n_ineq} ==="
+    print(_format_table(results, device, title=title))
 
 
 if __name__ == "__main__":

@@ -303,7 +303,11 @@ Compare runtimes with JAX, the Torch ADMM projector, qpth, `pinet-qp`
 
 ```bash
 python -m src.benchmarks.torch.bench_project
+python -m src.benchmarks.torch.bench_project --suite
 ```
+
+`--suite` sweeps several polytope shapes and reports `||Δqp||` (error vs the
+high-accuracy PDIPM) as well as `||Δjax||` (error vs the JAX ADMM projector).
 
 Install qpth for the qpth column with `pip install qpth --no-deps`.
 qpth 0.0.18 pins `numpy<2`, which conflicts with JAX, so skip its
