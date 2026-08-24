@@ -2,10 +2,9 @@
 
 from collections.abc import Callable
 
-import jax
 import jax.numpy as jnp
 
-from pinet._typing import ColScaling, RowScaling, ScalarLike
+from pinet._typing import BatchedLifted, ColScaling, RowScaling, ScalarLike
 from pinet.constants import Constants
 from pinet.constraints import (
     AffineInequalityConstraint,
@@ -94,7 +93,7 @@ def make_admm_kernels(
 ) -> tuple[
     Callable[
         [ProjectionInstance, ProjectionInstance, ScalarLike, ScalarLike],
-        tuple[ProjectionInstance, jax.Array, jax.Array],
+        tuple[ProjectionInstance, BatchedLifted, BatchedLifted],
     ],
     Callable[
         [ProjectionInstance, ProjectionInstance, ScalarLike, ScalarLike],
@@ -123,7 +122,7 @@ def make_admm_kernels(
         y_raw: ProjectionInstance,
         sigma: ScalarLike = PROJECTION_DEFAULT_SIGMA,
         omega: ScalarLike = PROJECTION_DEFAULT_OMEGA,
-    ) -> tuple[ProjectionInstance, jax.Array, jax.Array]:
+    ) -> tuple[ProjectionInstance, BatchedLifted, BatchedLifted]:
         """One ADMM iteration, returning the next state and both blocks.
 
         Args:

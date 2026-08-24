@@ -24,10 +24,13 @@ from .equilibration import ruiz_equilibration
 from .solver import initialize, make_admm_kernels
 from .solver.acceleration import (
     AccelCarry,
+    AdaptiveCarry,
     AdmmRawStep,
     accelerated_loop,
+    adaptive_loop,
     identity_raw_step,
     init_accel_carry,
+    init_adaptive_carry,
 )
 
 PROJECTION_DEFAULT_SIGMA = Constants.PROJECTION_DEFAULT_SIGMA
@@ -38,6 +41,7 @@ PROJECTION_DEFAULT_MAX_ITER = Constants.PROJECTION_DEFAULT_MAX_ITER
 PROJECTION_DEFAULT_CHECK_REDUCTION = Constants.PROJECTION_DEFAULT_CHECK_REDUCTION
 PROJECTION_DEFAULT_ANDERSON = Constants.PROJECTION_DEFAULT_ANDERSON
 PROJECTION_ANDERSON_MEMORY = Constants.PROJECTION_ANDERSON_MEMORY
+PROJECTION_ANDERSON_MIN_HISTORY = Constants.PROJECTION_ANDERSON_MIN_HISTORY
 PROJECTION_DEFAULT_ADAPTIVE_PENALTY = Constants.PROJECTION_DEFAULT_ADAPTIVE_PENALTY
 
 
@@ -94,8 +98,11 @@ class Project:
                 ``sigma``.
             anderson_memory: Number of past iterates mixed by Anderson.
         """
-        if use_anderson and anderson_memory < 2:
-            raise ValueError("anderson_memory must be at least 2 when Anderson is on.")
+        if use_anderson and anderson_memory < PROJECTION_ANDERSON_MIN_HISTORY:
+            raise ValueError(
+                "anderson_memory must be at least "
+                f"{PROJECTION_ANDERSON_MIN_HISTORY} when Anderson is on."
+            )
         self.eq_constraint = eq_constraint
         self.ineq_constraint = ineq_constraint
         self.box_constraint = box_constraint
@@ -341,9 +348,11 @@ class Project:
         tol: float = PROJECTION_DEFAULT_TOL,
         max_iter: int = PROJECTION_DEFAULT_MAX_ITER,
         reduction: str | float = PROJECTION_DEFAULT_CHECK_REDUCTION,
-        use_anderson: bool = True,
+        use_anderson: bool = False,
         use_adaptive_penalty: bool = True,
-    ) -> Callable[[ProjectionInstance], tuple[ProjectionInstance, jax.Array, int]]:
+    ) -> Callable[
+        [ProjectionInstance], tuple[ProjectionInstance, jax.Array, jax.Array | int]
+    ]:
         """Returns a function that projects input and checks constraint violation.
 
         Args:
@@ -357,10 +366,12 @@ class Project:
                 "mean" (mean cv less than tol), or a float in (0, 1)
                 (fraction of instances with cv less than tol).
             use_anderson: Mix iterates with Type-II Anderson acceleration.
-                Defaults to True even when the ``Project`` was constructed
-                without Anderson, so solve-to-tolerance is accelerated.
+                Off by default: mixing reduces iterations but the extra
+                kernels are rarely worth it on CPU. Pass True to opt in.
             use_adaptive_penalty: Residual-balance the ADMM penalty
-                ``sigma`` across chunks.
+                ``sigma``. On by default so a poorly scaled penalty is
+                corrected; when ``sigma`` is already well chosen the
+                extra work is a cheap residual check every few steps.
 
         Returns:
             Callable: Takes as input the points to be projected and any
@@ -384,71 +395,133 @@ class Project:
                     "Valid options are: 'max', 'mean', or a float in (0, 1)."
                 )
 
-        accelerate = (not self.is_single_simple_constraint) and (
-            use_anderson or use_adaptive_penalty
-        )
-        if accelerate:
+        # Device-side ``while_loop`` avoids host sync on every feasibility
+        # check. Acceleration flags only change the inner step; the original
+        # solver uses the same fused outer loop with the unaccelerated map.
+        hist_memory = self.anderson_memory if use_anderson else 1
+        raw_step = self.raw_step
+        step_iteration = self.step_iteration
+        step_final = self.step_final
+        d_c = self.d_c
+        initialize_fn = self.initialize
+        if use_anderson and (not self.is_single_simple_constraint):
 
-            def _advance(
-                carry: AccelCarry,
+            @jax.jit
+            def project_and_check_aa(
                 y_raw: ProjectionInstance,
-                omega: ScalarLike,
-                n_iter: int,
-            ) -> AccelCarry:
-                return accelerated_loop(
-                    self.raw_step,
-                    carry,
-                    y_raw,
-                    omega,
-                    n_iter,
-                    use_anderson=use_anderson,
-                    use_adaptive_penalty=use_adaptive_penalty,
-                    anderson_memory=self.anderson_memory,
-                )
+            ) -> tuple[ProjectionInstance, jax.Array, jax.Array]:
+                s0 = initialize_fn(y_raw)
+                carry0 = init_accel_carry(s0, sigma, hist_memory)
 
-            advance = jax.jit(_advance, static_argnames=["n_iter"])
+                def cond(
+                    state: tuple[ProjectionInstance, AccelCarry, jax.Array, jax.Array],
+                ) -> jax.Array:
+                    _, _, it, done = state
+                    return jnp.logical_and(jnp.logical_not(done), it < max_iter)
 
-            def project_and_check(
-                y_raw: ProjectionInstance,
-            ) -> tuple[ProjectionInstance, jax.Array, int]:
-                iter_exec = 0
-                terminate = False
-                y0 = self.initialize(y_raw)
-                carry = init_accel_carry(y0, sigma, self.anderson_memory)
-                xproj = y_raw
-                while not (terminate or iter_exec >= max_iter):
-                    carry = advance(carry, y_raw, omega, check_every)
-                    xproj = _finalize_projection(
-                        self.step_final, self.d_c, carry.s, y_raw
+                def body(
+                    state: tuple[ProjectionInstance, AccelCarry, jax.Array, jax.Array],
+                ) -> tuple[ProjectionInstance, AccelCarry, jax.Array, jax.Array]:
+                    _, carry_in, it, _ = state
+                    carry_out = accelerated_loop(
+                        raw_step,
+                        carry_in,
+                        y_raw,
+                        omega,
+                        check_every,
+                        use_anderson=True,
+                        use_adaptive_penalty=use_adaptive_penalty,
+                        anderson_memory=hist_memory,
                     )
-                    iter_exec += check_every
-                    terminate = check(xproj)
-                return xproj, jnp.array(terminate), iter_exec
+                    xproj = _finalize_projection(step_final, d_c, carry_out.s, y_raw)
+                    done = check(xproj)
+                    return xproj, carry_out, it + jnp.int32(check_every), done
 
-            return project_and_check
-
-        def project_and_check_original(
-            y_raw: ProjectionInstance,
-        ) -> tuple[ProjectionInstance, jax.Array, int]:
-            iter_exec = 0
-            terminate = False
-            y0 = self.initialize(y_raw)
-            xproj = y_raw
-            while not (terminate or iter_exec >= max_iter):
-                xproj, y = self.call(
-                    s0=y0,
-                    y_raw=y_raw,
-                    sigma=sigma,
-                    omega=omega,
-                    n_iter=check_every,
+                xproj, _, it, done = jax.lax.while_loop(
+                    cond,
+                    body,
+                    (y_raw, carry0, jnp.int32(0), jnp.array(False)),
                 )
-                y0 = y
-                iter_exec += check_every
-                terminate = check(xproj)
+                return xproj, done, it
 
-            return xproj, jnp.array(terminate), iter_exec
+            return project_and_check_aa
 
-        return project_and_check_original
+        if use_adaptive_penalty and (not self.is_single_simple_constraint):
+
+            @jax.jit
+            def project_and_check_ad(
+                y_raw: ProjectionInstance,
+            ) -> tuple[ProjectionInstance, jax.Array, jax.Array]:
+                s0 = initialize_fn(y_raw)
+                carry0 = init_adaptive_carry(s0, sigma)
+
+                def cond(
+                    state: tuple[ProjectionInstance, AdaptiveCarry, jax.Array, jax.Array],
+                ) -> jax.Array:
+                    _, _, it, done = state
+                    return jnp.logical_and(jnp.logical_not(done), it < max_iter)
+
+                def body(
+                    state: tuple[ProjectionInstance, AdaptiveCarry, jax.Array, jax.Array],
+                ) -> tuple[ProjectionInstance, AdaptiveCarry, jax.Array, jax.Array]:
+                    _, carry_in, it, _ = state
+                    carry_out = adaptive_loop(
+                        raw_step, carry_in, y_raw, omega, check_every
+                    )
+                    xproj = _finalize_projection(step_final, d_c, carry_out.s, y_raw)
+                    done = check(xproj)
+                    return xproj, carry_out, it + jnp.int32(check_every), done
+
+                xproj, _, it, done = jax.lax.while_loop(
+                    cond,
+                    body,
+                    (y_raw, carry0, jnp.int32(0), jnp.array(False)),
+                )
+                return xproj, done, it
+
+            return project_and_check_ad
+
+        @jax.jit
+        def project_and_check_orig(
+            y_raw: ProjectionInstance,
+        ) -> tuple[ProjectionInstance, jax.Array, jax.Array]:
+            s0 = initialize_fn(y_raw)
+
+            def cond(
+                state: tuple[
+                    ProjectionInstance, ProjectionInstance, jax.Array, jax.Array
+                ],
+            ) -> jax.Array:
+                _, _, it, done = state
+                return jnp.logical_and(jnp.logical_not(done), it < max_iter)
+
+            def body(
+                state: tuple[
+                    ProjectionInstance, ProjectionInstance, jax.Array, jax.Array
+                ],
+            ) -> tuple[ProjectionInstance, ProjectionInstance, jax.Array, jax.Array]:
+                _, s_in, it, _ = state
+                s_out, _ = jax.lax.scan(
+                    lambda s_prev, _: (
+                        step_iteration(s_prev, y_raw, sigma, omega),
+                        None,
+                    ),
+                    s_in,
+                    None,
+                    length=check_every,
+                )
+                xproj = _finalize_projection(step_final, d_c, s_out, y_raw)
+                done = check(xproj)
+                return xproj, s_out, it + jnp.int32(check_every), done
+
+            xproj, _, it, done = jax.lax.while_loop(
+                cond,
+                body,
+                (y_raw, s0, jnp.int32(0), jnp.array(False)),
+            )
+            return xproj, done, it
+
+        return project_and_check_orig
 
     def _project_single(self, y_raw: ProjectionInstance) -> ProjectionInstance:
         """Project a batch of points with single constraint.
@@ -525,7 +598,7 @@ def _advance_governing_sequence(
     """
     assert n_iter > 0, "Number of iterations must be positive."
     s0 = initialize_fn(y_raw) if s0 is None else s0
-    if use_anderson or use_adaptive_penalty:
+    if use_anderson:
         carry = init_accel_carry(s0, sigma, anderson_memory)
         carry = accelerated_loop(
             raw_step,
@@ -533,11 +606,15 @@ def _advance_governing_sequence(
             y_raw,
             omega,
             n_iter,
-            use_anderson=use_anderson,
+            use_anderson=True,
             use_adaptive_penalty=use_adaptive_penalty,
             anderson_memory=anderson_memory,
         )
         return carry.s, carry.sigma
+    if use_adaptive_penalty:
+        carry_ad = init_adaptive_carry(s0, sigma)
+        carry_ad = adaptive_loop(raw_step, carry_ad, y_raw, omega, n_iter)
+        return carry_ad.s, carry_ad.sigma
 
     sk, _ = jax.lax.scan(
         lambda s_prev, _: (

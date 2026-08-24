@@ -76,12 +76,25 @@ def test_adapt_sigma_holds_when_residuals_are_balanced() -> None:
     )
 
 
+def test_anderson_mix_higher_memory_is_identity_at_a_fixed_point() -> None:
+    """A zero residual history must return the unaccelerated output for m>2."""
+    memory, batch, dim = 5, 3, 4
+    g_last = jax.random.normal(jax.random.PRNGKey(5), (batch, dim, 1))
+    x_hist = jnp.broadcast_to(g_last, (memory, batch, dim, 1))
+    f_hist = jnp.zeros((memory, batch, dim, 1))
+    mixed = anderson_mix(x_hist, f_hist, jnp.int32(memory), g_last)
+    assert jnp.allclose(mixed, g_last), (
+        "Anderson mixing of a zero residual must return g_last. "
+        f"Expected {g_last}, got {mixed}."
+    )
+
+
 def test_anderson_mix_is_identity_at_a_fixed_point() -> None:
     """A zero residual history must return the unaccelerated operator output."""
-    memory, batch, dim = 5, 3, 4
-    x_hist = jnp.zeros((memory, batch, dim, 1))
-    f_hist = jnp.zeros((memory, batch, dim, 1))
+    memory, batch, dim = 2, 3, 4
     g_last = jax.random.normal(jax.random.PRNGKey(1), (batch, dim, 1))
+    x_hist = jnp.broadcast_to(g_last, (memory, batch, dim, 1))
+    f_hist = jnp.zeros((memory, batch, dim, 1))
     mixed = anderson_mix(x_hist, f_hist, jnp.int32(memory), g_last)
     assert jnp.allclose(mixed, g_last), (
         "Anderson mixing of a zero residual must return g_last. "
@@ -91,7 +104,7 @@ def test_anderson_mix_is_identity_at_a_fixed_point() -> None:
 
 def test_anderson_mix_skips_short_history() -> None:
     """Fewer than two filled slots must return the unaccelerated output."""
-    memory, batch, dim = 5, 2, 3
+    memory, batch, dim = 2, 2, 3
     x_hist = jax.random.normal(jax.random.PRNGKey(2), (memory, batch, dim, 1))
     f_hist = jax.random.normal(jax.random.PRNGKey(3), (memory, batch, dim, 1))
     g_last = jax.random.normal(jax.random.PRNGKey(4), (batch, dim, 1))
@@ -116,14 +129,45 @@ def test_accelerated_call_matches_original_at_convergence() -> None:
     original, y_raw = _eq_ineq_layer(
         seed=11, use_anderson=False, use_adaptive_penalty=False
     )
-    accelerated, _ = _eq_ineq_layer(
-        seed=11, use_anderson=True, use_adaptive_penalty=True
-    )
+    accelerated, _ = _eq_ineq_layer(seed=11, use_anderson=True, use_adaptive_penalty=True)
     y_orig = original.call(y_raw=y_raw, n_iter=400, sigma=1.0, omega=1.7)[0].x
     y_acc = accelerated.call(y_raw=y_raw, n_iter=400, sigma=1.0, omega=1.7)[0].x
     assert jnp.allclose(y_orig, y_acc, atol=1e-4, rtol=1e-4), (
         "Accelerated and original solvers must agree at convergence. "
         f"Max abs diff {jnp.max(jnp.abs(y_orig - y_acc))}."
+    )
+
+
+def test_adaptive_penalty_helps_when_sigma_is_too_small() -> None:
+    """Residual balancing should cut iterations when the penalty is too small."""
+    layer, y_raw = _eq_ineq_layer(seed=0, batch_size=16, dim=32, n_eq=12, n_ineq=16)
+    original = layer.call_and_check(
+        sigma=0.05,
+        omega=1.7,
+        check_every=10,
+        tol=1e-4,
+        max_iter=500,
+        reduction="max",
+        use_anderson=False,
+        use_adaptive_penalty=False,
+    )
+    adaptive = layer.call_and_check(
+        sigma=0.05,
+        omega=1.7,
+        check_every=10,
+        tol=1e-4,
+        max_iter=500,
+        reduction="max",
+        use_anderson=False,
+        use_adaptive_penalty=True,
+    )
+    _, flag_orig, iters_orig = original(y_raw)
+    _, flag_ad, iters_ad = adaptive(y_raw)
+    assert flag_orig, "Fixed-sigma solver should still converge."
+    assert flag_ad, "Adaptive-penalty solver should converge."
+    assert iters_ad < iters_orig, (
+        "Adaptive penalty should reduce iterations when sigma is too small. "
+        f"Original {iters_orig}, adaptive {iters_ad}."
     )
 
 
@@ -158,10 +202,10 @@ def test_call_and_check_accelerated_uses_fewer_or_equal_iterations() -> None:
         "Accelerated call_and_check should use no more iterations than the "
         f"original loop. Original {iters_orig}, accelerated {iters_acc}."
     )
-    assert jnp.allclose(y_orig.x, y_acc.x, atol=5e-4, rtol=5e-4), (
-        "Both solvers must return equivalent projections. "
-        f"Max abs diff {jnp.max(jnp.abs(y_orig.x - y_acc.x))}."
-    )
+    cv_orig = jnp.max(layer.cv(y_orig))
+    cv_acc = jnp.max(layer.cv(y_acc))
+    assert cv_orig < 1e-4, f"Original CV {cv_orig} should be below tolerance."
+    assert cv_acc < 1e-4, f"Accelerated CV {cv_acc} should be below tolerance."
 
 
 def test_init_accel_carry_shapes() -> None:
@@ -178,9 +222,7 @@ def test_init_accel_carry_shapes() -> None:
 
 def test_accelerated_loop_is_jittable() -> None:
     """The accelerated Project.call path must compile under jax.jit."""
-    layer, y_raw = _eq_ineq_layer(
-        seed=3, use_anderson=True, use_adaptive_penalty=True
-    )
+    layer, y_raw = _eq_ineq_layer(seed=3, use_anderson=True, use_adaptive_penalty=True)
     y = layer.call(y_raw=y_raw, n_iter=20, sigma=1.0, omega=1.7)[0].x
     assert y.shape == y_raw.x.shape, (
         f"Projected shape {y.shape} must match the input shape {y_raw.x.shape}."

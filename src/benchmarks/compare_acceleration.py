@@ -1,8 +1,11 @@
 """Compare original vs accelerated Douglas-Rachford on random projections.
 
 Reports wall-clock time and iteration count of ``call_and_check`` for the
-original ADMM loop against Type-II Anderson acceleration, residual
-balancing, and both together.
+original ADMM map against Type-II Anderson acceleration, residual
+balancing, and both together. ``host_loop`` is the pre-fusion Python
+``while`` that synchronized with the host on every feasibility check;
+``original`` is the same unaccelerated map inside a device-side
+``while_loop``.
 
 .. code-block:: console
 
@@ -12,6 +15,7 @@ balancing, and both together.
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import jax
@@ -37,12 +41,23 @@ class BenchCase:
     n_eq: int
     n_ineq: int
     seed: int = 0
+    sigma: float = 1.0
 
 
 CASES: tuple[BenchCase, ...] = (
     BenchCase("small", batch_size=16, dim=32, n_eq=12, n_ineq=16, seed=0),
     BenchCase("medium", batch_size=32, dim=80, n_eq=30, n_ineq=40, seed=1),
     BenchCase("large", batch_size=64, dim=120, n_eq=40, n_ineq=50, seed=2),
+    BenchCase("xlarge", batch_size=32, dim=400, n_eq=120, n_ineq=120, seed=3),
+    BenchCase(
+        "bad_sigma",
+        batch_size=16,
+        dim=32,
+        n_eq=12,
+        n_ineq=16,
+        seed=0,
+        sigma=0.05,
+    ),
 )
 
 VARIANTS: tuple[tuple[str, bool, bool], ...] = (
@@ -56,7 +71,6 @@ REPEATS = 5
 CHECK_EVERY = 10
 TOL = 1e-4
 MAX_ITER = 500
-SIGMA = 1.0
 OMEGA = 1.7
 
 
@@ -78,8 +92,59 @@ def _make_problem(case: BenchCase) -> tuple[Project, ProjectionInstance]:
     return layer, ProjectionInstance(x=xinfeas)
 
 
+def _host_loop_solver(
+    layer: Project,
+    sigma: float,
+) -> Callable[[ProjectionInstance], tuple[ProjectionInstance, jax.Array, int]]:
+    """Rebuild the pre-fusion Python while-loop around ``Project.call``.
+
+    Args:
+        layer: Projection layer whose unaccelerated ``call`` is stepped.
+        sigma: ADMM penalty.
+
+    Returns:
+        Solve-to-tolerance callable matching ``call_and_check``.
+    """
+    check_every = CHECK_EVERY
+    max_iter = MAX_ITER
+    tol = TOL
+
+    @jax.jit
+    def _check(inp: ProjectionInstance) -> jax.Array:
+        return jnp.max(layer.cv(inp)) < tol
+
+    def project_and_check(
+        y_raw: ProjectionInstance,
+    ) -> tuple[ProjectionInstance, jax.Array, int]:
+        iter_exec = 0
+        terminate = False
+        y0 = layer.initialize(y_raw)
+        xproj = y_raw
+        while not (terminate or iter_exec >= max_iter):
+            xproj, y0 = layer.call(
+                s0=y0,
+                y_raw=y_raw,
+                sigma=sigma,
+                omega=OMEGA,
+                n_iter=check_every,
+            )
+            iter_exec += check_every
+            terminate = bool(_check(xproj))
+        return xproj, jnp.array(terminate), iter_exec
+
+    return project_and_check
+
+
 def _max_cv(layer: Project, y: ProjectionInstance) -> float:
-    """Return the batch-max constraint violation."""
+    """Return the batch-max constraint violation.
+
+    Args:
+        layer: Projection layer.
+        y: Candidate projection.
+
+    Returns:
+        Maximum constraint violation over the batch.
+    """
     return float(jnp.max(layer.cv(y)))
 
 
@@ -93,30 +158,46 @@ def run() -> None:
     print("-" * len(header))
     for case in CASES:
         layer, y_raw = _make_problem(case)
-        original_ms: float | None = None
+        baseline_ms: float | None = None
+        host_solver = _host_loop_solver(layer, case.sigma)
+        solvers: list[
+            tuple[
+                str,
+                Callable[
+                    [ProjectionInstance],
+                    tuple[ProjectionInstance, jax.Array, jax.Array | int],
+                ],
+            ]
+        ] = [("host_loop", host_solver)]
         for name, use_anderson, use_adaptive in VARIANTS:
-            solver = layer.call_and_check(
-                sigma=SIGMA,
-                omega=OMEGA,
-                check_every=CHECK_EVERY,
-                tol=TOL,
-                max_iter=MAX_ITER,
-                reduction="max",
-                use_anderson=use_anderson,
-                use_adaptive_penalty=use_adaptive,
+            solvers.append(
+                (
+                    name,
+                    layer.call_and_check(
+                        sigma=case.sigma,
+                        omega=OMEGA,
+                        check_every=CHECK_EVERY,
+                        tol=TOL,
+                        max_iter=MAX_ITER,
+                        reduction="max",
+                        use_anderson=use_anderson,
+                        use_adaptive_penalty=use_adaptive,
+                    ),
+                )
             )
+        for name, solver in solvers:
             y, flag, iters = solver(y_raw)
-            _ = y.x.block_until_ready()
+            jax.block_until_ready(y.x)
             times: list[float] = []
             for _ in range(REPEATS):
                 start = time.perf_counter()
                 y, flag, iters = solver(y_raw)
-                _ = y.x.block_until_ready()
+                jax.block_until_ready(y.x)
                 times.append(time.perf_counter() - start)
             mean_ms = (sum(times) / len(times)) * 1e3
-            if original_ms is None:
-                original_ms = mean_ms
-            speedup = original_ms / mean_ms if mean_ms > 0 else float("inf")
+            if baseline_ms is None:
+                baseline_ms = mean_ms
+            speedup = baseline_ms / mean_ms if mean_ms > 0 else float("inf")
             cv = _max_cv(layer, y)
             ok = "yes" if bool(flag) else "no"
             print(
