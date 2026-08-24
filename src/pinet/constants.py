@@ -18,6 +18,16 @@ class Constants:
         PROJECTION_DEFAULT_TOL: Default constraint-violation tolerance.
         PROJECTION_DEFAULT_MAX_ITER: Default max projection iterations.
         PROJECTION_DEFAULT_CHECK_REDUCTION: Default batch reduction method.
+        PROJECTION_DEFAULT_ANDERSON: Default Anderson acceleration flag.
+        PROJECTION_ANDERSON_MEMORY: Anderson history length.
+        PROJECTION_ANDERSON_REGULARIZATION: Anderson least-squares regularization.
+        PROJECTION_ANDERSON_SAFEGUARD: Anderson residual-ratio safeguard.
+        PROJECTION_DEFAULT_ADAPTIVE_PENALTY: Default residual-balancing flag.
+        PROJECTION_ADAPTIVE_PENALTY_MU: Residual-ratio threshold for penalty updates.
+        PROJECTION_ADAPTIVE_PENALTY_TAU: Multiplicative penalty step.
+        PROJECTION_ADAPTIVE_PENALTY_EVERY: Penalty update period.
+        PROJECTION_ADAPTIVE_PENALTY_SIGMA_MIN: Lower bound on adapted sigma.
+        PROJECTION_ADAPTIVE_PENALTY_SIGMA_MAX: Upper bound on adapted sigma.
     """
 
     # Numerical Stability
@@ -65,3 +75,36 @@ class Constants:
     # Default reduction method for batch constraint checks:
     # "max", "mean", or a float in [0, 1]
     PROJECTION_DEFAULT_CHECK_REDUCTION: str = "max"
+
+    # Enable Type-II Anderson acceleration of the Douglas-Rachford
+    # governing sequence. Off by default so ``call(n_iter=...)`` stays
+    # bit-identical to the original solver; ``call_and_check`` turns it
+    # on unless the caller opts out.
+    PROJECTION_DEFAULT_ANDERSON: bool = False
+
+    # Number of past iterates mixed by Anderson acceleration.
+    PROJECTION_ANDERSON_MEMORY: int = 5
+
+    # Tikhonov regularization for the Anderson least-squares Gram matrix.
+    PROJECTION_ANDERSON_REGULARIZATION: float = 1e-8
+
+    # Reject the Anderson candidate when its residual exceeds this
+    # multiple of the unaccelerated residual.
+    PROJECTION_ANDERSON_SAFEGUARD: float = 2.0
+
+    # Enable residual-balancing updates of the ADMM penalty ``sigma``.
+    # Same default policy as Anderson acceleration above.
+    PROJECTION_DEFAULT_ADAPTIVE_PENALTY: bool = False
+
+    # Residual-ratio threshold for penalty updates (Boyd et al.).
+    PROJECTION_ADAPTIVE_PENALTY_MU: float = 10.0
+
+    # Multiplicative penalty step when residuals are unbalanced.
+    PROJECTION_ADAPTIVE_PENALTY_TAU: float = 2.0
+
+    # Update ``sigma`` every this many iterations.
+    PROJECTION_ADAPTIVE_PENALTY_EVERY: int = 10
+
+    # Bounds on the adapted penalty.
+    PROJECTION_ADAPTIVE_PENALTY_SIGMA_MIN: float = 1e-4
+    PROJECTION_ADAPTIVE_PENALTY_SIGMA_MAX: float = 1e2

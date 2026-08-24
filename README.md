@@ -255,6 +255,7 @@ cv = proj.cv(y)  # (B, 1, 1) max violation across constraints
 - **Batch rules:** For each pair of tensors `(X, Y)`, either batch sizes match or one is `1` (broadcast).
 - **Equality `method`:** Use `method="pinv"` when you rely on the equality projector standalone. When used inside `Project`, you can keep `method=None`; lifting will set up the pseudo-inverse internally.
 - **Dimensions after lifting:** If inequalities are present, the internal lifted dimension is `d + n_ineq` (auxiliary variables).
+- **Acceleration:** `call_and_check` turns on Type-II Anderson acceleration and residual balancing of `sigma` by default, which typically reduces the iteration count to a given feasibility tolerance. Pass `use_anderson=False, use_adaptive_penalty=False` to recover the original Douglas-Rachford loop. The same flags on `Project(...)` apply to fixed-`n_iter` `call()` (off by default so training remains bit-identical).
 
 ---
 

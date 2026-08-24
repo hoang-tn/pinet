@@ -21,7 +21,14 @@ from .dataclasses import (
     ProjectionInstance,
 )
 from .equilibration import ruiz_equilibration
-from .solver import build_iteration_step, initialize
+from .solver import initialize, make_admm_kernels
+from .solver.acceleration import (
+    AccelCarry,
+    AdmmRawStep,
+    accelerated_loop,
+    identity_raw_step,
+    init_accel_carry,
+)
 
 PROJECTION_DEFAULT_SIGMA = Constants.PROJECTION_DEFAULT_SIGMA
 PROJECTION_DEFAULT_OMEGA = Constants.PROJECTION_DEFAULT_OMEGA
@@ -29,6 +36,9 @@ PROJECTION_DEFAULT_CHECK_EVERY = Constants.PROJECTION_DEFAULT_CHECK_EVERY
 PROJECTION_DEFAULT_TOL = Constants.PROJECTION_DEFAULT_TOL
 PROJECTION_DEFAULT_MAX_ITER = Constants.PROJECTION_DEFAULT_MAX_ITER
 PROJECTION_DEFAULT_CHECK_REDUCTION = Constants.PROJECTION_DEFAULT_CHECK_REDUCTION
+PROJECTION_DEFAULT_ANDERSON = Constants.PROJECTION_DEFAULT_ANDERSON
+PROJECTION_ANDERSON_MEMORY = Constants.PROJECTION_ANDERSON_MEMORY
+PROJECTION_DEFAULT_ADAPTIVE_PENALTY = Constants.PROJECTION_DEFAULT_ADAPTIVE_PENALTY
 
 
 class Project:
@@ -41,6 +51,10 @@ class Project:
         nl_constraints: List of non-linear constraints.
         unroll: Use loop unrolling for backpropagation.
         equilibration_params: Parameters for equilibration.
+        use_anderson: Mix Douglas-Rachford iterates with Type-II Anderson
+            acceleration.
+        use_adaptive_penalty: Residual-balance the ADMM penalty ``sigma``.
+        anderson_memory: Number of past iterates mixed by Anderson.
     """
 
     eq_constraint: EqualityConstraint | None = None
@@ -49,6 +63,9 @@ class Project:
     nl_constraints: list[NonLinearConstraint] | None = None
     unroll: bool = False
     equilibration_params: EquilibrationParams | None = None
+    use_anderson: bool = PROJECTION_DEFAULT_ANDERSON
+    use_adaptive_penalty: bool = PROJECTION_DEFAULT_ADAPTIVE_PENALTY
+    anderson_memory: int = PROJECTION_ANDERSON_MEMORY
 
     def __init__(
         self,
@@ -58,6 +75,9 @@ class Project:
         nl_constraints: list[NonLinearConstraint] | None = None,
         unroll: bool = False,
         equilibration_params: EquilibrationParams | None = None,
+        use_anderson: bool = PROJECTION_DEFAULT_ANDERSON,
+        use_adaptive_penalty: bool = PROJECTION_DEFAULT_ADAPTIVE_PENALTY,
+        anderson_memory: int = PROJECTION_ANDERSON_MEMORY,
     ) -> None:
         """Initialize projection layer.
 
@@ -68,12 +88,22 @@ class Project:
             nl_constraints: List of non-linear constraints.
             unroll: Use loop unrolling for backpropagation.
             equilibration_params: Parameters for equilibration.
+            use_anderson: Mix Douglas-Rachford iterates with Type-II
+                Anderson acceleration.
+            use_adaptive_penalty: Residual-balance the ADMM penalty
+                ``sigma``.
+            anderson_memory: Number of past iterates mixed by Anderson.
         """
+        if use_anderson and anderson_memory < 2:
+            raise ValueError("anderson_memory must be at least 2 when Anderson is on.")
         self.eq_constraint = eq_constraint
         self.ineq_constraint = ineq_constraint
         self.box_constraint = box_constraint
         self.nl_constraints = nl_constraints
         self.unroll = unroll
+        self.use_anderson = use_anderson
+        self.use_adaptive_penalty = use_adaptive_penalty
+        self.anderson_memory = anderson_memory
         if equilibration_params is None:
             self.equilibration_params = EquilibrationParams()
         else:
@@ -105,6 +135,7 @@ class Project:
 
         self.dim_lifted = self.dim
         self.step_iteration = lambda s_prev, y_raw, sigma, omega: s_prev
+        self.raw_step = identity_raw_step
         self.step_final = self._project_single
         self.single_constraint = constraints[0]
         self.d_r = jnp.ones((1, self.single_constraint.n_constraints, 1))
@@ -180,7 +211,7 @@ class Project:
                     scale=box_scale,
                 )
 
-                self.step_iteration, self.step_final = build_iteration_step(
+                self.raw_step, self.step_iteration, self.step_final = make_admm_kernels(
                     self.lifted_eq_constraint,
                     self.lifted_primitive_constraint,
                     self.dim,
@@ -212,7 +243,7 @@ class Project:
                 self.d_r = jnp.ones((1, self.lifted_eq_constraint.a_mat.shape[1], 1))
                 self.d_c = jnp.ones((1, self.dim_lifted, 1))
 
-                self.step_iteration, self.step_final = build_iteration_step(
+                self.raw_step, self.step_iteration, self.step_final = make_admm_kernels(
                     eq_constraint=self.lifted_eq_constraint,
                     box_constraint=self.lifted_primitive_constraint,
                     dim=self.dim,
@@ -249,6 +280,10 @@ class Project:
                 step_iteration=self.step_iteration,
                 step_final=self.step_final,
                 dim_lifted=self.dim_lifted,
+                raw_step=self.raw_step,
+                use_anderson=self.use_anderson,
+                use_adaptive_penalty=self.use_adaptive_penalty,
+                anderson_memory=self.anderson_memory,
                 d_r=self.d_r,
                 d_c=self.d_c,
             ),
@@ -306,6 +341,8 @@ class Project:
         tol: float = PROJECTION_DEFAULT_TOL,
         max_iter: int = PROJECTION_DEFAULT_MAX_ITER,
         reduction: str | float = PROJECTION_DEFAULT_CHECK_REDUCTION,
+        use_anderson: bool = True,
+        use_adaptive_penalty: bool = True,
     ) -> Callable[[ProjectionInstance], tuple[ProjectionInstance, jax.Array, int]]:
         """Returns a function that projects input and checks constraint violation.
 
@@ -319,6 +356,11 @@ class Project:
                 Valid options are "max" (maximum cv less than tol),
                 "mean" (mean cv less than tol), or a float in (0, 1)
                 (fraction of instances with cv less than tol).
+            use_anderson: Mix iterates with Type-II Anderson acceleration.
+                Defaults to True even when the ``Project`` was constructed
+                without Anderson, so solve-to-tolerance is accelerated.
+            use_adaptive_penalty: Residual-balance the ADMM penalty
+                ``sigma`` across chunks.
 
         Returns:
             Callable: Takes as input the points to be projected and any
@@ -342,13 +384,54 @@ class Project:
                     "Valid options are: 'max', 'mean', or a float in (0, 1)."
                 )
 
-        def project_and_check(
+        accelerate = (not self.is_single_simple_constraint) and (
+            use_anderson or use_adaptive_penalty
+        )
+        if accelerate:
+
+            def _advance(
+                carry: AccelCarry,
+                y_raw: ProjectionInstance,
+                omega: ScalarLike,
+                n_iter: int,
+            ) -> AccelCarry:
+                return accelerated_loop(
+                    self.raw_step,
+                    carry,
+                    y_raw,
+                    omega,
+                    n_iter,
+                    use_anderson=use_anderson,
+                    use_adaptive_penalty=use_adaptive_penalty,
+                    anderson_memory=self.anderson_memory,
+                )
+
+            advance = jax.jit(_advance, static_argnames=["n_iter"])
+
+            def project_and_check(
+                y_raw: ProjectionInstance,
+            ) -> tuple[ProjectionInstance, jax.Array, int]:
+                iter_exec = 0
+                terminate = False
+                y0 = self.initialize(y_raw)
+                carry = init_accel_carry(y0, sigma, self.anderson_memory)
+                xproj = y_raw
+                while not (terminate or iter_exec >= max_iter):
+                    carry = advance(carry, y_raw, omega, check_every)
+                    xproj = _finalize_projection(
+                        self.step_final, self.d_c, carry.s, y_raw
+                    )
+                    iter_exec += check_every
+                    terminate = check(xproj)
+                return xproj, jnp.array(terminate), iter_exec
+
+            return project_and_check
+
+        def project_and_check_original(
             y_raw: ProjectionInstance,
         ) -> tuple[ProjectionInstance, jax.Array, int]:
-            # Executed iterations
             iter_exec = 0
             terminate = False
-            # Call the projection function with all given arguments.
             y0 = self.initialize(y_raw)
             xproj = y_raw
             while not (terminate or iter_exec >= max_iter):
@@ -365,7 +448,7 @@ class Project:
 
             return xproj, jnp.array(terminate), iter_exec
 
-        return project_and_check
+        return project_and_check_original
 
     def _project_single(self, y_raw: ProjectionInstance) -> ProjectionInstance:
         """Project a batch of points with single constraint.
@@ -384,6 +467,90 @@ class Project:
         return self.single_constraint.project(y_raw)
 
 
+def _finalize_projection(
+    step_final: Callable[[ProjectionInstance], ProjectionInstance],
+    d_c: ColScaling,
+    sk: ProjectionInstance,
+    y_raw: ProjectionInstance,
+) -> ProjectionInstance:
+    """Unscale the equality-block projection back to the original variables.
+
+    Args:
+        step_final: Equality-block projector.
+        d_c: Column scaling of the lifted problem.
+        sk: Governing sequence iterate.
+        y_raw: Original projection request (used for batch shape and specs).
+
+    Returns:
+        Projected point in the original coordinates.
+    """
+    primal_dim = y_raw.x.shape[1]
+    y = step_final(sk).x[:, :primal_dim, :]
+    return y_raw.update(x=y * d_c[:, :primal_dim, :])
+
+
+def _advance_governing_sequence(
+    initialize_fn: Callable[[ProjectionInstance], ProjectionInstance],
+    step_iteration: Callable[
+        [ProjectionInstance, ProjectionInstance, ScalarLike, ScalarLike],
+        ProjectionInstance,
+    ],
+    raw_step: AdmmRawStep,
+    y_raw: ProjectionInstance,
+    s0: ProjectionInstance | None,
+    sigma: ScalarLike,
+    omega: ScalarLike,
+    n_iter: int,
+    use_anderson: bool,
+    use_adaptive_penalty: bool,
+    anderson_memory: int,
+) -> tuple[ProjectionInstance, ScalarLike]:
+    """Run ``n_iter`` Douglas-Rachford steps, optionally accelerated.
+
+    Args:
+        initialize_fn: Governing-sequence initializer.
+        step_iteration: Unaccelerated ADMM step.
+        raw_step: ADMM step that also returns the two blocks.
+        y_raw: Point to be projected.
+        s0: Optional warm start for the governing sequence.
+        sigma: ADMM penalty.
+        omega: Relaxation parameter.
+        n_iter: Number of iterations to run.
+        use_anderson: Enable Type-II Anderson mixing.
+        use_adaptive_penalty: Enable residual balancing of ``sigma``.
+        anderson_memory: Anderson history length.
+
+    Returns:
+        The governing sequence and the penalty used on the last step.
+    """
+    assert n_iter > 0, "Number of iterations must be positive."
+    s0 = initialize_fn(y_raw) if s0 is None else s0
+    if use_anderson or use_adaptive_penalty:
+        carry = init_accel_carry(s0, sigma, anderson_memory)
+        carry = accelerated_loop(
+            raw_step,
+            carry,
+            y_raw,
+            omega,
+            n_iter,
+            use_anderson=use_anderson,
+            use_adaptive_penalty=use_adaptive_penalty,
+            anderson_memory=anderson_memory,
+        )
+        return carry.s, carry.sigma
+
+    sk, _ = jax.lax.scan(
+        lambda s_prev, _: (
+            step_iteration(s_prev, y_raw, sigma, omega),
+            None,
+        ),
+        s0,
+        None,
+        length=n_iter,
+    )
+    return sk, sigma
+
+
 # Project general
 def _project_general(
     initialize_fn: Callable[[ProjectionInstance], ProjectionInstance],
@@ -393,6 +560,10 @@ def _project_general(
     ],
     step_final: Callable[[ProjectionInstance], ProjectionInstance],
     dim_lifted: int,
+    raw_step: AdmmRawStep,
+    use_anderson: bool,
+    use_adaptive_penalty: bool,
+    anderson_memory: int,
     d_r: RowScaling,
     d_c: ColScaling,
     y_raw: ProjectionInstance,
@@ -408,6 +579,10 @@ def _project_general(
         step_iteration: Function for the iteration step.
         step_final: Function for the final step.
         dim_lifted: Dimension of the lifted space.
+        raw_step: ADMM step that also returns the two blocks.
+        use_anderson: Mix iterates with Type-II Anderson acceleration.
+        use_adaptive_penalty: Residual-balance the ADMM penalty.
+        anderson_memory: Anderson history length.
         d_r: Scaling factor for the rows.
         d_c: Scaling factor for the columns.
         y_raw: Point to be projected.
@@ -419,24 +594,22 @@ def _project_general(
     Returns:
         A pair ``(projected_point, governing_sequence_value)``.
     """
+    del dim_lifted, d_r
     assert n_iter > 0, "Number of iterations must be positive."
-
-    s0 = initialize_fn(y_raw) if s0 is None else s0
-    sk, _ = jax.lax.scan(
-        lambda s_prev, _: (
-            step_iteration(s_prev, y_raw, sigma, omega),
-            None,
-        ),
-        s0,
-        None,
-        length=n_iter,
+    sk, _ = _advance_governing_sequence(
+        initialize_fn=initialize_fn,
+        step_iteration=step_iteration,
+        raw_step=raw_step,
+        y_raw=y_raw,
+        s0=s0,
+        sigma=sigma,
+        omega=omega,
+        n_iter=n_iter,
+        use_anderson=use_anderson,
+        use_adaptive_penalty=use_adaptive_penalty,
+        anderson_memory=anderson_memory,
     )
-
-    y = step_final(sk).x[:, : y_raw.x.shape[1], :]
-    y_scaled = y * d_c[:, : y_raw.x.shape[1], :]
-
-    # Unscale the output
-    return y_raw.update(x=y_scaled), sk
+    return _finalize_projection(step_final, d_c, sk, y_raw), sk
 
 
 @partial(
@@ -446,6 +619,10 @@ def _project_general(
         "step_iteration",
         "step_final",
         "dim_lifted",
+        "raw_step",
+        "use_anderson",
+        "use_adaptive_penalty",
+        "anderson_memory",
         "n_iter",
         "n_iter_bwd",
         "fpi",
@@ -459,6 +636,10 @@ def _project_general_custom(
     ],
     step_final: Callable[[ProjectionInstance], ProjectionInstance],
     dim_lifted: int,
+    raw_step: AdmmRawStep,
+    use_anderson: bool,
+    use_adaptive_penalty: bool,
+    anderson_memory: int,
     d_r: RowScaling,
     d_c: ColScaling,
     y_raw: ProjectionInstance,
@@ -474,6 +655,10 @@ def _project_general_custom(
         step_iteration=step_iteration,
         step_final=step_final,
         dim_lifted=dim_lifted,
+        raw_step=raw_step,
+        use_anderson=use_anderson,
+        use_adaptive_penalty=use_adaptive_penalty,
+        anderson_memory=anderson_memory,
         d_r=d_r,
         d_c=d_c,
         s0=s0,
@@ -492,6 +677,10 @@ def _project_general_fwd(
     ],
     step_final: Callable[[ProjectionInstance], ProjectionInstance],
     dim_lifted: int,
+    raw_step: AdmmRawStep,
+    use_anderson: bool,
+    use_adaptive_penalty: bool,
+    anderson_memory: int,
     d_r: RowScaling,
     d_c: ColScaling,
     y_raw: ProjectionInstance,
@@ -512,27 +701,22 @@ def _project_general_fwd(
         ScalarLike,
     ],
 ]:
-    # unpack trailing options that belong only to custom vjp
-    # The decorated function returns a (ProjectionInstance, ProjectionInstance) tuple,
-    # but jax.custom_vjp's wrapper hides the precise signature from the typechecker.
-    custom_result: tuple[ProjectionInstance, ProjectionInstance] = (
-        _project_general_custom(
-            initialize_fn=initialize_fn,
-            step_iteration=step_iteration,
-            step_final=step_final,
-            dim_lifted=dim_lifted,
-            d_r=d_r,
-            d_c=d_c,
-            s0=s0,
-            y_raw=y_raw,
-            sigma=sigma,
-            omega=omega,
-            n_iter=n_iter,
-        )
+    del dim_lifted, n_iter_bwd, fpi
+    sk, sigma_final = _advance_governing_sequence(
+        initialize_fn=initialize_fn,
+        step_iteration=step_iteration,
+        raw_step=raw_step,
+        y_raw=y_raw,
+        s0=s0,
+        sigma=sigma,
+        omega=omega,
+        n_iter=n_iter,
+        use_anderson=use_anderson,
+        use_adaptive_penalty=use_adaptive_penalty,
+        anderson_memory=anderson_memory,
     )
-    y, s_k = custom_result
-
-    return (y, s_k), (s_k, y_raw, d_r, d_c, sigma, omega)
+    y = _finalize_projection(step_final, d_c, sk, y_raw)
+    return (y, sk), (sk, y_raw, d_r, d_c, sigma_final, omega)
 
 
 def _project_general_bwd(
@@ -543,6 +727,10 @@ def _project_general_bwd(
     ],
     step_final: Callable[[ProjectionInstance], ProjectionInstance],
     dim_lifted: int,
+    raw_step: AdmmRawStep,
+    use_anderson: bool,
+    use_adaptive_penalty: bool,
+    anderson_memory: int,
     n_iter: int,
     n_iter_bwd: int,
     fpi: bool,
@@ -573,6 +761,10 @@ def _project_general_bwd(
         step_iteration: Function for the iteration step.
         step_final: Function for the final step.
         dim_lifted: Dimension of the lifted space.
+        raw_step: ADMM step that also returns the two blocks.
+        use_anderson: Unused; the VJP differentiates the unaccelerated map.
+        use_adaptive_penalty: Unused; the VJP uses the frozen final penalty.
+        anderson_memory: Unused Anderson history length.
         n_iter: Number of iterations to run.
         n_iter_bwd: Number of iterations for backward pass.
         fpi: Whether to use fixed-point iteration.
@@ -582,6 +774,8 @@ def _project_general_bwd(
     Returns:
         tuple: The computed cotangent for the projection.
     """
+    del initialize_fn, raw_step, use_anderson, use_adaptive_penalty
+    del anderson_memory, n_iter
     s_k, y_raw, _, d_c, sigma, omega = residuals
     cotangent_zk1, _ = cotangent
 

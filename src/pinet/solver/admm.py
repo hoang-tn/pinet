@@ -2,6 +2,7 @@
 
 from collections.abc import Callable
 
+import jax
 import jax.numpy as jnp
 
 from pinet._typing import ColScaling, RowScaling, ScalarLike
@@ -85,6 +86,93 @@ def initialize(
     return y_raw.update(x=jnp.zeros((y_raw.x.shape[0], dim_lifted, 1)))
 
 
+def make_admm_kernels(
+    eq_constraint: EqualityConstraint,
+    box_constraint: BoxConstraint | CartesianConstraint,
+    dim: int,
+    scale: ColScaling | float = 1.0,
+) -> tuple[
+    Callable[
+        [ProjectionInstance, ProjectionInstance, ScalarLike, ScalarLike],
+        tuple[ProjectionInstance, jax.Array, jax.Array],
+    ],
+    Callable[
+        [ProjectionInstance, ProjectionInstance, ScalarLike, ScalarLike],
+        ProjectionInstance,
+    ],
+    Callable[[ProjectionInstance], ProjectionInstance],
+]:
+    """Build the ADMM kernels used by the projection layer.
+
+    See https://web.stanford.edu/~boyd/papers/pdf/admm_distr_stats.pdf for details.
+
+    Args:
+        eq_constraint: (Lifted) Equality constraint.
+        box_constraint: (Lifted) Box constraint.
+        dim: Dimension of the original problem.
+        scale: Scaling of primal variables.
+
+    Returns:
+        A triple ``(raw_step, iteration_step, result_retrieval_step)``.
+        ``raw_step`` also returns the equality and box block values so
+        residual balancing can use them without extra projections.
+    """
+
+    def raw_step(
+        sk: ProjectionInstance,
+        y_raw: ProjectionInstance,
+        sigma: ScalarLike = PROJECTION_DEFAULT_SIGMA,
+        omega: ScalarLike = PROJECTION_DEFAULT_OMEGA,
+    ) -> tuple[ProjectionInstance, jax.Array, jax.Array]:
+        """One ADMM iteration, returning the next state and both blocks.
+
+        Args:
+            sk: State iterate for the ADMM solver.
+            y_raw: Point to be projected.
+            sigma: ADMM parameter.
+            omega: ADMM parameter.
+
+        Returns:
+            Next governing sequence together with the equality block
+            ``z`` and the box block ``t``.
+        """
+        zk = eq_constraint.project(sk)
+        reflect = 2 * zk.x - sk.x
+        tobox = jnp.concatenate(
+            (
+                (2 * sigma * scale * y_raw.x + reflect[:, :dim, :])
+                / (1 + 2 * sigma * scale**2),
+                reflect[:, dim:, :],
+            ),
+            axis=1,
+        )
+        tk = box_constraint.project(sk.update(x=tobox))
+        sk_next = sk.update(x=sk.x + omega * (tk.x - zk.x))
+        return sk_next, zk.x, tk.x
+
+    def iteration_step(
+        sk: ProjectionInstance,
+        y_raw: ProjectionInstance,
+        sigma: ScalarLike = PROJECTION_DEFAULT_SIGMA,
+        omega: ScalarLike = PROJECTION_DEFAULT_OMEGA,
+    ) -> ProjectionInstance:
+        """One iteration of the ADMM solver.
+
+        Args:
+            sk: State iterate for the ADMM solver.
+            y_raw: Point to be projected.
+            sigma: ADMM parameter.
+            omega: ADMM parameter.
+
+        Returns:
+            Next state iterate of the ADMM solver.
+        """
+        sk_next, _, _ = raw_step(sk, y_raw, sigma, omega)
+        return sk_next
+
+    return (raw_step, iteration_step, eq_constraint.project)
+
+
 def build_iteration_step(
     eq_constraint: EqualityConstraint,
     box_constraint: BoxConstraint | CartesianConstraint,
@@ -110,37 +198,7 @@ def build_iteration_step(
     Returns:
         A pair ``(iteration_step, result_retrieval_step)``.
     """
-
-    def iteration_step(
-        sk: ProjectionInstance,
-        y_raw: ProjectionInstance,
-        sigma: ScalarLike = PROJECTION_DEFAULT_SIGMA,
-        omega: ScalarLike = PROJECTION_DEFAULT_OMEGA,
-    ) -> ProjectionInstance:
-        """One iteration of the ADMM solver.
-
-        Args:
-            sk: State iterate for the ADMM solver.
-            y_raw: Point to be projected.
-            sigma: ADMM parameter.
-            omega: ADMM parameter.
-
-        Returns:
-            Next state iterate of the ADMM solver.
-        """
-        zk = eq_constraint.project(sk)
-        # Reflection
-        reflect = 2 * zk.x - sk.x
-        tobox = jnp.concatenate(
-            (
-                (2 * sigma * scale * y_raw.x + reflect[:, :dim, :])
-                / (1 + 2 * sigma * scale**2),
-                reflect[:, dim:, :],
-            ),
-            axis=1,
-        )
-        tk = box_constraint.project(sk.update(x=tobox))
-        sk = sk.update(x=sk.x + omega * (tk.x - zk.x))
-        return sk
-
-    return (iteration_step, eq_constraint.project)
+    _, iteration_step, result_retrieval_step = make_admm_kernels(
+        eq_constraint, box_constraint, dim, scale
+    )
+    return (iteration_step, result_retrieval_step)
